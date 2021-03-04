@@ -22,6 +22,8 @@ import os
 import modeling
 import optimization
 import tensorflow as tf
+import horovod.tensorflow as hvd
+from tensorflow.python import debug as tf_debug
 
 flags = tf.flags
 
@@ -36,6 +38,18 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "input_file", None,
     "Input TF example files (can be a glob or comma separated).")
+
+flags.DEFINE_string(
+    "validation_input_file", None,
+    "Input validation TF example files (can be a glob or comma separated).")
+
+flags.DEFINE_string(
+    "input_dir", None,
+    "Input TF example dir.")
+
+flags.DEFINE_string(
+    "validation_input_dir", None,
+    "Input validation TF example dir.")
 
 flags.DEFINE_string(
     "output_dir", None,
@@ -61,6 +75,8 @@ flags.DEFINE_bool("do_train", False, "Whether to run training.")
 
 flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
 
+flags.DEFINE_bool("do_train_eval", False, "Whether to run train with eval.")
+
 flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
 
 flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
@@ -77,7 +93,7 @@ flags.DEFINE_integer("save_checkpoints_steps", 1000,
 flags.DEFINE_integer("iterations_per_loop", 1000,
                      "How many steps to make in each estimator call.")
 
-flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
+flags.DEFINE_integer("max_eval_steps", None, "Maximum number of eval steps.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
@@ -106,9 +122,48 @@ flags.DEFINE_integer(
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
 
+flags.DEFINE_integer("hooking_frequence", 100, "Hooking frequence.")
+
+flags.DEFINE_bool("reduce_log", False, "Reduce log.")
+
+flags.DEFINE_integer("keep_checkpoint_max", 1, "Keep checkpoint max.")
+
+flags.DEFINE_bool("xla", True, "Whether to train with XLA optimization.")
+
+flags.DEFINE_bool("adjust_lr", True, "Whether to adjust learning_rate.")
+
+flags.DEFINE_integer("previous_train_steps", 0, "Previous train steps.")
+
+flags.DEFINE_integer("post_train_steps", 0, "Post train steps.")
+
+flags.DEFINE_bool("use_hvd", True, "Whether to use Horovod.")
+
+flags.DEFINE_bool("use_compression", True, "Whether to use compression in Horovod.")
+
+flags.DEFINE_bool("use_fp16", True, "Whether to use fp16.")
+
+flags.DEFINE_bool("cos_decay", False, "Whether to use cos decay.")
+
+flags.DEFINE_bool("use_lamb", False, "Whether to use lamb.")
+
+flags.DEFINE_bool("auto_recover", False, "Whether to use auto recover.")
+
+flags.DEFINE_string("recover_dir", None, "The output directory where the model checkpoints will be recovered.")
+
+flags.DEFINE_integer("ckpt_no", None, "Checkpoint number of model to be recovered.")
+
+flags.DEFINE_integer("ckpt_no_input", None, "Checkpoint number of input to be recovered.")
+
+flags.DEFINE_bool("clip", False, "Whether to use clip.")
+
+flags.DEFINE_bool("profile", False, "Whether to use profile.")
+
+
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+                     use_one_hot_embeddings, adjust_lr, use_hvd,
+                     use_compression, use_fp16, clip, cos_decay,
+                     use_lamb, previous_train_steps, post_train_steps):
   """Returns `model_fn` closure for TPUEstimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -134,16 +189,17 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
         input_ids=input_ids,
         input_mask=input_mask,
         token_type_ids=segment_ids,
-        use_one_hot_embeddings=use_one_hot_embeddings)
+        use_one_hot_embeddings=use_one_hot_embeddings,
+        compute_type=tf.float16 if use_fp16 else tf.float32)
 
     (masked_lm_loss,
-     masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
-         bert_config, model.get_sequence_output(), model.get_embedding_table(),
-         masked_lm_positions, masked_lm_ids, masked_lm_weights)
+    masked_lm_example_loss, masked_lm_log_probs) = get_masked_lm_output(
+        bert_config, model.get_sequence_output(), model.get_embedding_table(),
+        masked_lm_positions, masked_lm_ids, masked_lm_weights, clip)
 
     (next_sentence_loss, next_sentence_example_loss,
-     next_sentence_log_probs) = get_next_sentence_output(
-         bert_config, model.get_pooled_output(), next_sentence_labels)
+    next_sentence_log_probs) = get_next_sentence_output(
+        bert_config, model.get_pooled_output(), next_sentence_labels, clip)
 
     total_loss = masked_lm_loss + next_sentence_loss
 
@@ -174,14 +230,16 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
-      train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+      train_op, update_learning_rate = optimization.create_optimizer(
+          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu, adjust_lr, use_hvd,
+          use_compression, use_fp16, clip, cos_decay, use_lamb, previous_train_steps, post_train_steps)
 
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      logging_hook = tf.train.LoggingTensorHook({"loss": total_loss, "learning_rate": update_learning_rate}, every_n_iter=FLAGS.hooking_frequence)
+      output_spec = tf.estimator.EstimatorSpec(
           mode=mode,
           loss=total_loss,
           train_op=train_op,
-          scaffold_fn=scaffold_fn)
+          training_hooks=[logging_hook])
     elif mode == tf.estimator.ModeKeys.EVAL:
 
       def metric_fn(masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
@@ -219,16 +277,15 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
             "next_sentence_loss": next_sentence_mean_loss,
         }
 
-      eval_metrics = (metric_fn, [
+      eval_metrics = metric_fn(
           masked_lm_example_loss, masked_lm_log_probs, masked_lm_ids,
           masked_lm_weights, next_sentence_example_loss,
           next_sentence_log_probs, next_sentence_labels
-      ])
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+      )
+      output_spec = tf.estimator.EstimatorSpec(
           mode=mode,
           loss=total_loss,
-          eval_metrics=eval_metrics,
-          scaffold_fn=scaffold_fn)
+          eval_metric_ops=eval_metrics)
     else:
       raise ValueError("Only TRAIN and EVAL modes are supported: %s" % (mode))
 
@@ -238,7 +295,7 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
 
 
 def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
-                         label_ids, label_weights):
+                         label_ids, label_weights, clip):
   """Get loss and log probs for the masked LM."""
   input_tensor = gather_indexes(input_tensor, positions)
 
@@ -262,7 +319,10 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
         initializer=tf.zeros_initializer())
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
-    log_probs = tf.nn.log_softmax(logits, axis=-1)
+    if clip:
+      log_probs = tf.log(tf.clip_by_value(tf.nn.softmax(logits, axis=-1), 1e-6, 1.0 - 1e-6))
+    else:
+      log_probs = tf.nn.log_softmax(logits, axis=-1)
 
     label_ids = tf.reshape(label_ids, [-1])
     label_weights = tf.reshape(label_weights, [-1])
@@ -282,7 +342,7 @@ def get_masked_lm_output(bert_config, input_tensor, output_weights, positions,
   return (loss, per_example_loss, log_probs)
 
 
-def get_next_sentence_output(bert_config, input_tensor, labels):
+def get_next_sentence_output(bert_config, input_tensor, labels, clip):
   """Get loss and log probs for the next sentence prediction."""
 
   # Simple binary classification. Note that 0 is "next sentence" and 1 is
@@ -297,7 +357,10 @@ def get_next_sentence_output(bert_config, input_tensor, labels):
 
     logits = tf.matmul(input_tensor, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
-    log_probs = tf.nn.log_softmax(logits, axis=-1)
+    if clip:
+      log_probs = tf.log(tf.clip_by_value(tf.nn.softmax(logits, axis=-1), 1e-6, 1.0 - 1e-6))
+    else:
+      log_probs = tf.nn.log_softmax(logits, axis=-1)
     labels = tf.reshape(labels, [-1])
     one_hot_labels = tf.one_hot(labels, depth=2, dtype=tf.float32)
     per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
@@ -325,12 +388,14 @@ def input_fn_builder(input_files,
                      max_seq_length,
                      max_predictions_per_seq,
                      is_training,
-                     num_cpu_threads=4):
+                     num_cpu_threads=4,
+                     batch_size=None,
+                     use_hvd=True):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
   def input_fn(params):
     """The actual input function."""
-    batch_size = params["batch_size"]
+    # batch_size = params["batch_size"]
 
     name_to_features = {
         "input_ids":
@@ -353,6 +418,11 @@ def input_fn_builder(input_files,
     # For eval, we want no shuffling and parallel reading doesn't matter.
     if is_training:
       d = tf.data.Dataset.from_tensor_slices(tf.constant(input_files))
+
+      if use_hvd:
+        d = d.shard(hvd.size(), hvd.rank()) #TODO only for Horovod, shard to mimic single_GPU = False
+        print("Data shard: %s %s" % (hvd.size(), hvd.rank()))
+
       d = d.repeat()
       d = d.shuffle(buffer_size=len(input_files))
 
@@ -371,7 +441,7 @@ def input_fn_builder(input_files,
       d = tf.data.TFRecordDataset(input_files)
       # Since we evaluate for a fixed number of steps we don't want to encounter
       # out-of-range exceptions.
-      d = d.repeat()
+      # d = d.repeat()
 
     # We must `drop_remainder` on training because the TPU requires fixed
     # size dimensions. For eval, we assume we are evaluating on the CPU or GPU
@@ -406,36 +476,90 @@ def _decode_record(record, name_to_features):
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
-  if not FLAGS.do_train and not FLAGS.do_eval:
+  if FLAGS.use_hvd:
+    hvd.init()
+
+    if FLAGS.reduce_log and (hvd.rank() != 0):
+      tf.logging.set_verbosity(tf.logging.ERROR)
+
+    FLAGS.output_dir = FLAGS.output_dir if hvd.rank() == 0 else os.path.join(FLAGS.output_dir, str(hvd.rank()))
+
+  if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_train_eval:
     raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
 
+  if FLAGS.recover_dir is not None:
+    if FLAGS.use_hvd:
+      FLAGS.recover_dir = FLAGS.recover_dir if hvd.rank() == 0 else os.path.join(FLAGS.recover_dir, str(hvd.rank()))
+    path_ckpt = os.path.join(FLAGS.output_dir, "checkpoint")
+    path_ckpt_input = os.path.join(FLAGS.output_dir, "checkpoint_input")
+
+    if FLAGS.ckpt_no is not None and not tf.gfile.Exists(path_ckpt):
+      with tf.gfile.GFile(path_ckpt, "w") as writer:
+        writer.write('model_checkpoint_path: "%s-%s"\n' % (os.path.join(FLAGS.recover_dir, "model.ckpt"), str(FLAGS.ckpt_no)))
+        writer.write('all_model_checkpoint_paths: "%s-%s"\n' % (os.path.join(FLAGS.recover_dir, "model.ckpt"), str(FLAGS.ckpt_no)))
+
+    if FLAGS.ckpt_no_input is not None and not tf.gfile.Exists(path_ckpt_input):
+      with tf.gfile.GFile(path_ckpt_input, "w") as writer:
+        writer.write('model_checkpoint_path: "%s-%s"\n' % (os.path.join(FLAGS.recover_dir, "input.ckpt"), str(FLAGS.ckpt_no_input)))
+        writer.write('all_model_checkpoint_paths: "%s-%s"\n' % (os.path.join(FLAGS.recover_dir, "input.ckpt"), str(FLAGS.ckpt_no_input)))
+
+  if FLAGS.use_hvd and hvd.rank() == 0 and (FLAGS.do_train or FLAGS.do_train_eval):
+    (cpath, cname) = os.path.split(FLAGS.bert_config_file)
+    tf.gfile.Copy(FLAGS.bert_config_file, os.path.join(FLAGS.output_dir, cname), True)
+
   input_files = []
-  for input_pattern in FLAGS.input_file.split(","):
-    input_files.extend(tf.gfile.Glob(input_pattern))
+  if FLAGS.input_file is not None:
+    for input_pattern in FLAGS.input_file.split(","):
+      input_files.extend(tf.gfile.Glob(input_pattern))
+  if FLAGS.input_dir is not None:
+    for filename in tf.gfile.ListDirectory(FLAGS.input_dir):
+      input_files.extend(tf.gfile.Glob(os.path.join(FLAGS.input_dir, filename)))
 
   tf.logging.info("*** Input Files ***")
   for input_file in input_files:
     tf.logging.info("  %s" % input_file)
 
-  tpu_cluster_resolver = None
-  if FLAGS.use_tpu and FLAGS.tpu_name:
-    tpu_cluster_resolver = tf.contrib.cluster_resolver.TPUClusterResolver(
-        FLAGS.tpu_name, zone=FLAGS.tpu_zone, project=FLAGS.gcp_project)
+  validation_input_files = []
+  if FLAGS.validation_input_file is None and FLAGS.validation_input_dir is None:
+    validation_input_files = input_files
+  else:
+    if FLAGS.validation_input_file is not None:
+      for input_pattern in FLAGS.validation_input_file.split(","):
+        validation_input_files.extend(tf.gfile.Glob(input_pattern))
+    if FLAGS.validation_input_dir is not None:
+      for filename in tf.gfile.ListDirectory(FLAGS.validation_input_dir):
+        validation_input_files.extend(tf.gfile.Glob(os.path.join(FLAGS.validation_input_dir, filename)))
 
-  is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
-  run_config = tf.contrib.tpu.RunConfig(
-      cluster=tpu_cluster_resolver,
-      master=FLAGS.master,
+  tf.logging.info("*** Input Validation Files ***")
+  for input_file in validation_input_files:
+    tf.logging.info("  %s" % input_file)
+
+  config = tf.ConfigProto()
+  if FLAGS.xla:
+    config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+  if FLAGS.use_hvd:
+    config.gpu_options.visible_device_list = str(hvd.local_rank())
+    config.gpu_options.allow_growth=True
+
+  run_config = tf.estimator.RunConfig(
       model_dir=FLAGS.output_dir,
+      keep_checkpoint_max=FLAGS.keep_checkpoint_max,
       save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-      tpu_config=tf.contrib.tpu.TPUConfig(
-          iterations_per_loop=FLAGS.iterations_per_loop,
-          num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+      log_step_count_steps=FLAGS.hooking_frequence,
+      session_config=config)
+
+  if FLAGS.use_hvd and hvd.rank() != 0 and not FLAGS.auto_recover:
+    run_config = tf.estimator.RunConfig(
+        model_dir=FLAGS.output_dir,
+        keep_checkpoint_max=FLAGS.keep_checkpoint_max,
+        save_checkpoints_steps=None,
+        save_checkpoints_secs=None,
+        log_step_count_steps=FLAGS.hooking_frequence,
+        session_config=config)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -444,16 +568,36 @@ def main(_):
       num_train_steps=FLAGS.num_train_steps,
       num_warmup_steps=FLAGS.num_warmup_steps,
       use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      use_one_hot_embeddings=FLAGS.use_tpu,
+      adjust_lr=FLAGS.adjust_lr,
+      use_hvd=FLAGS.use_hvd,
+      use_compression=FLAGS.use_compression,
+      use_fp16=FLAGS.use_fp16,
+      clip=FLAGS.clip,
+      cos_decay=FLAGS.cos_decay,
+      use_lamb=FLAGS.use_lamb,
+      previous_train_steps=FLAGS.previous_train_steps,
+      post_train_steps=FLAGS.post_train_steps)
+
+  hooks = []
+
+  if FLAGS.use_hvd:
+    hooks.append(hvd.BroadcastGlobalVariablesHook(0))
+
+    if hvd.rank() == -1: #if debug, set 0
+      CLIDebugHook = tf_debug.LocalCLIDebugHook(ui_type='readline')
+      CLIDebugHook.add_tensor_filter("has_inf_or_nan", tf_debug.has_inf_or_nan)
+      hooks.append(CLIDebugHook)
+
+    if FLAGS.profile and hvd.rank() == 0:
+      ProfilerHook = tf.train.ProfilerHook(save_steps=FLAGS.hooking_frequence, output_dir=FLAGS.output_dir, show_dataflow=True, show_memory=True)
+      hooks.append(ProfilerHook)
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
-      use_tpu=FLAGS.use_tpu,
+  estimator = tf.estimator.Estimator(
       model_fn=model_fn,
-      config=run_config,
-      train_batch_size=FLAGS.train_batch_size,
-      eval_batch_size=FLAGS.eval_batch_size)
+      config=run_config)
 
   if FLAGS.do_train:
     tf.logging.info("***** Running training *****")
@@ -462,18 +606,26 @@ def main(_):
         input_files=input_files,
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=True)
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
+        is_training=True,
+        batch_size=FLAGS.train_batch_size,
+        use_hvd=FLAGS.use_hvd)
+
+    if FLAGS.auto_recover:
+      hooks.append(tf.data.experimental.CheckpointInputPipelineHook(estimator))
+
+    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps, hooks=hooks)
 
   if FLAGS.do_eval:
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
     eval_input_fn = input_fn_builder(
-        input_files=input_files,
+        input_files=validation_input_files,
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
-        is_training=False)
+        is_training=False,
+        batch_size=FLAGS.eval_batch_size,
+        use_hvd=FLAGS.use_hvd)
 
     result = estimator.evaluate(
         input_fn=eval_input_fn, steps=FLAGS.max_eval_steps)
@@ -485,9 +637,37 @@ def main(_):
         tf.logging.info("  %s = %s", key, str(result[key]))
         writer.write("%s = %s\n" % (key, str(result[key])))
 
+  if FLAGS.do_train_eval:
+    tf.logging.info("***** Running training *****")
+    tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
+    train_input_fn = input_fn_builder(
+        input_files=input_files,
+        max_seq_length=FLAGS.max_seq_length,
+        max_predictions_per_seq=FLAGS.max_predictions_per_seq,
+        is_training=True,
+        batch_size=FLAGS.train_batch_size,
+        use_hvd=FLAGS.use_hvd)
+
+    tf.logging.info("***** Running evaluation *****")
+    tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
+    eval_input_fn = input_fn_builder(
+        input_files=validation_input_files,
+        max_seq_length=FLAGS.max_seq_length,
+        max_predictions_per_seq=FLAGS.max_predictions_per_seq,
+        is_training=False,
+        batch_size=FLAGS.eval_batch_size,
+        use_hvd=FLAGS.use_hvd)
+
+    if FLAGS.auto_recover:
+      hooks.append(tf.data.experimental.CheckpointInputPipelineHook(estimator))
+
+    train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps, hooks=hooks)
+    eval_spec = tf.estimator.EvalSpec(input_fn=eval_input_fn, steps=FLAGS.max_eval_steps)
+    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+
 
 if __name__ == "__main__":
-  flags.mark_flag_as_required("input_file")
+  # flags.mark_flag_as_required("input_file")
   flags.mark_flag_as_required("bert_config_file")
   flags.mark_flag_as_required("output_dir")
   tf.app.run()
