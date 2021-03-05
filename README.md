@@ -1,33 +1,48 @@
-# Project
+# DistributedBERT
 
-> This repo has been populated by an initial template to help get you started. Please
-> make sure to update the content to build a great experience for community-building.
+DistributedBERT is based on the official TensorFlow BERT with following improvements
+- Higher performance: Support distributed training through Horovod with nearly linear acceleration, support mixed-precision training
+- Higher accuracy: Bug fixes and integrated with more advanced techs such as LAMB
+- Easier to use: Customized with more settings
+- More robust: Preemption and failure recovery
+- Easy to leverage: Easy to apply in other BERT-like models such as RoBERTa, ALBERT, ...
 
-As the maintainer of this project, please make a few updates:
+## Requirements
 
-- Improving this README.MD file to provide a great experience
-- Updating SUPPORT.MD with content about this project's support experience
-- Understanding the security reporting process in SECURITY.MD
-- Remove this section from the README
+- NVIDIA CUDA 10.0+
+- Open MPI 3.1.0+
+- Tensorflow 1.13.1+
+- Horovod 0.16.0+
 
-## Contributing
+## Example Training Command
 
-This project welcomes contributions and suggestions.  Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
+```
+export CODE_PATH=/your/path/DistributedBERT
+export MODEL_PATH=/your/path/uncased_L-24_H-1024_A-16
+export OUTPUT_PATH=/your/path/output
+export TRAIN_DATA=/your/path/train
+export TEST_DATA=/your/path/test
 
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
-
-## Trademarks
-
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
+mpirun -np 4 -H localhost:4 -bind-to none -map-by slot \
+    -mca pml ob1 -mca btl ^openib -mca btl_tcp_if_include eth0 \
+    -x NCCL_DEBUG=INFO -x LD_LIBRARY_PATH -x PATH \
+    python $CODE_PATH/run_classifier.py \
+    --data_dir $TRAIN_DATA \
+    --test_data_dir $TEST_DATA \
+    --output_dir $OUTPUT_PATH \
+    --vocab_file $MODEL_PATH/vocab.txt \
+    --bert_config_file $MODEL_PATH/bert_config.json \
+    --init_checkpoint $MODEL_PATH/bert_model.ckpt \
+    --do_train \
+    --do_predict \
+    --task_name=qk \
+    --label_list=0,1,2,3 \
+    --max_seq_length=32 \
+    --train_batch_size=64 \
+    --num_train_epochs=3 \
+    --learning_rate=1e-5 \
+    --adjust_lr \
+    --xla \
+    --reduce_log \
+    --keep_checkpoint_max=1 \
+```
